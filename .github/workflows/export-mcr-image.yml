@@ -131,8 +131,10 @@ jobs:
       - name: 取回分片资产
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release download "aspnet-${{ inputs.tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --pattern 'image.part-*' \
             --pattern 'image.tar.gz.sha256' \
             --pattern 'digest.txt' -D out
@@ -149,6 +151,7 @@ jobs:
           git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git checkout -q --orphan image-cache
           cp out/* .
+          rm -rf out
           printf 'image=mcr.microsoft.com/dotnet/aspnet:%s\nparts=%s\n' \
             "${{ inputs.tag }}" "$(ls image.part-* | wc -l)" > IMAGE_INFO
           git add -A
