@@ -1,0 +1,158 @@
+# =============================================================================
+# export-mcr-image.yml —— 用 GitHub Actions 的 runner 代拉 MCR 镜像并导出
+#
+# 放置位置：<你的仓库>/.github/workflows/export-mcr-image.yml
+#
+# 原理：GitHub 托管 runner 有公网出口，能访问 mcr.microsoft.com；
+#       内网只需访问 GitHub 即可取回镜像 tar，字节与官方完全一致。
+#
+# 触发：Actions 页面手动 Run workflow（tag 填 10.0）
+# 产物：Release「aspnet-10.0」下的 image.tar.gz / .sha256 / digest.txt
+#       分片 image.part-00..NN（45MB/片）同时提交到 image-cache 分支作兜底
+# =============================================================================
+name: export-mcr-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'MCR 标签，如 10.0（浮动）或 10.0.14（固定）'
+        required: true
+        default: '10.0'
+      image:
+        description: 'MCR 镜像仓库'
+        required: true
+        default: 'mcr.microsoft.com/dotnet/aspnet'
+      split:
+        description: '额外切 45MB 分片并提交 image-cache 分支（仅 github.com 可达时用）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: export-mcr-image
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: 环境信息
+        run: |
+          docker version --format 'server={{.Server.Version}} os={{.Server.Os}}/{{.Server.Arch}}'
+          df -h / | tail -1
+
+      - name: 拉取镜像（强制 linux/amd64）
+        run: |
+          docker pull --platform linux/amd64 "${{ inputs.image }}:${{ inputs.tag }}"
+
+      - name: 补一个版本号别名（便于生产锁版本）
+        id: alias
+        run: |
+          set -euo pipefail
+          IMG="${{ inputs.image }}:${{ inputs.tag }}"
+          VER=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$IMG" \
+                | awk -F= '/^ASPNET_VERSION=/{print $2}' | tr -d '[:space:]')
+          if [ -z "$VER" ]; then
+            VER=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$IMG" \
+                  | awk -F= '/^DOTNET_VERSION=/{print $2}' | tr -d '[:space:]')
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "解析到运行时版本：${VER}"
+          docker tag "$IMG" "${{ inputs.image }}:${VER}"
+          docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep aspnet
+
+      - name: 记录 digest 与 image ID（校验基准）
+        run: |
+          set -euo pipefail
+          IMG="${{ inputs.image }}:${{ inputs.tag }}"
+          {
+            echo "image=${IMG}"
+            echo "alias=${{ inputs.image }}:${{ steps.alias.outputs.version }}"
+            echo "pulled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner_arch=$(uname -m)"
+            echo "repo_digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG")"
+            echo "image_id=$(docker inspect --format '{{.Id}}' "$IMG")"
+            echo "created=$(docker inspect --format '{{.Created}}' "$IMG")"
+            echo "size_bytes=$(docker inspect --format '{{.Size}}' "$IMG")"
+          } | tee digest.txt
+
+      - name: 导出为 tar.gz（含浮动 tag 与版本 tag）
+        run: |
+          set -euo pipefail
+          IMG="${{ inputs.image }}:${{ inputs.tag }}"
+          ALIAS="${{ inputs.image }}:${{ steps.alias.outputs.version }}"
+          docker save "$IMG" "$ALIAS" | gzip -1 > image.tar.gz
+          sha256sum image.tar.gz | tee image.tar.gz.sha256
+          ls -lh image.tar.gz
+
+      - name: 分片（45MB/片）
+        if: ${{ inputs.split }}
+        run: |
+          set -euo pipefail
+          split -b 45m -d -a 2 image.tar.gz image.part-
+          sha256sum image.part-* > image.parts.sha256
+          ls -lh image.part-*
+
+      - name: 发布 Release 资产（tag 固定，URL 可预测）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: aspnet-${{ inputs.tag }}
+          name: aspnet ${{ inputs.tag }} (build ${{ steps.alias.outputs.version }})
+          body: |
+            镜像：`${{ inputs.image }}:${{ inputs.tag }}` → 实际运行时 `${{ steps.alias.outputs.version }}`（linux/amd64）
+            由 GitHub Actions runner 从 MCR 直接 `docker pull` 并 `docker save`，字节与官方一致，未重建。
+
+            内网校验：`docker inspect --format '{{.Id}}'` 应等于 `digest.txt` 中的 `image_id`。
+          files: |
+            image.tar.gz
+            image.tar.gz.sha256
+            digest.txt
+            image.part-*
+            image.parts.sha256
+          overwrite_files: true
+          fail_on_unmatched_files: false
+
+  # ---------------------------------------------------------------------------
+  # 兜底通道：分片提交到孤儿分支 image-cache（内网只放行 github.com 时用）
+  # 内网用法：git clone --depth 1 -b image-cache https://github.com/<repo>.git
+  # ---------------------------------------------------------------------------
+  commit-parts:
+    if: ${{ inputs.split }}
+    needs: export
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: 取回分片资产
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "aspnet-${{ inputs.tag }}" \
+            --pattern 'image.part-*' \
+            --pattern 'image.tar.gz.sha256' \
+            --pattern 'digest.txt' -D out
+          ls -lh out
+
+      - name: 写入孤儿分支 image-cache（不依赖仓库已有提交）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git checkout -q --orphan image-cache
+          cp out/* .
+          printf 'image=mcr.microsoft.com/dotnet/aspnet:%s\nparts=%s\n' \
+            "${{ inputs.tag }}" "$(ls image.part-* | wc -l)" > IMAGE_INFO
+          git add -A
+          git commit -q -m "cache: aspnet ${{ inputs.tag }}"
+          git push -f origin image-cache
+          echo "已推送 image-cache 分支："
+          git ls-tree -l --name-only HEAD
