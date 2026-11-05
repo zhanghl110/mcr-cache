@@ -1,0 +1,132 @@
+# =============================================================================
+# build-mcr-base.yml —— 在 GitHub Actions 上构建「官方 aspnet + 补齐层」基线镜像
+#
+# 放置位置：<仓库>/.github/workflows/build-mcr-base.yml
+#
+# 为什么在这构建：内网 apt 源被劫持（NOSPLIT），装不了 libfontconfig1 等包；
+#                 runner 有干净的公网 apt，构建完整镜像导出，内网只 load。
+#
+# 产物：Release「dotnet-base-10.0-mcr」下的 base.tar.gz + 分片 + digest.txt
+# =============================================================================
+name: build-mcr-base
+
+on:
+  workflow_dispatch:
+    inputs:
+      aspnet_tag:
+        description: '官方 aspnet 标签'
+        required: true
+        default: '10.0'
+      split:
+        description: '切 45MB 分片'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mcr-base
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: 写基线 Dockerfile（内联，不依赖仓库文件）
+        run: |
+          cat > Dockerfile.mcr-base <<'DOCKERFILE'
+          FROM mcr.microsoft.com/dotnet/aspnet:${{ inputs.aspnet_tag }}
+
+          ARG APP_UID=1654
+          ARG APP_GID=1654
+
+          ENV TZ=Asia/Shanghai \
+              HOME=/app \
+              DOTNET_RUNNING_IN_CONTAINER=true
+
+          RUN set -eux; \
+              apt-get update; \
+              apt-get install -y --no-install-recommends \
+                  libfontconfig1 libfreetype6 libgssapi-krb5-2 curl; \
+              ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
+              echo "${TZ}" > /etc/timezone; \
+              rm -rf /var/lib/apt/lists/*; \
+              mkdir -p /app/DataProtection /app/logs; \
+              usermod -l appuser -d /app -s /usr/sbin/nologin app; \
+              chown -R "${APP_UID}:${APP_GID}" /app
+
+          RUN set -eux; \
+              command -v dotnet; \
+              dotnet --list-runtimes | grep -q 'Microsoft.AspNetCore.App 10\.'; \
+              ldconfig -p | grep -q libfontconfig; \
+              ldconfig -p | grep -q libfreetype; \
+              ldconfig -p | grep -q libgssapi_krb5; \
+              command -v curl; \
+              test -e /usr/share/zoneinfo/Asia/Shanghai; \
+              getent passwd 1654 | grep -q appuser
+
+          USER appuser
+          DOCKERFILE
+          sed -i 's/^[[:space:]]*//' Dockerfile.mcr-base
+          cat Dockerfile.mcr-base
+
+      - name: 构建
+        run: |
+          set -euo pipefail
+          docker build -f Dockerfile.mcr-base -t "ems/dotnet-base:10.0-mcr" .
+
+      - name: 运行期自检
+        run: |
+          set -euo pipefail
+          IMG=ems/dotnet-base:10.0-mcr
+          docker run --rm "$IMG" cat /etc/os-release | head -3
+          docker run --rm "$IMG" dotnet --info | sed -n '1,12p'
+          docker run --rm "$IMG" sh -c 'id; echo "HOME=$HOME"; echo "ASPNETCORE_HTTP_PORTS=$ASPNETCORE_HTTP_PORTS"'
+          docker run --rm "$IMG" sh -c 'ldconfig -p | grep -cE "libfontconfig|libfreetype|libgssapi_krb5"'
+          docker run --rm "$IMG" sh -c 'curl --version | head -1'
+
+      - name: 记录校验基准
+        run: |
+          set -euo pipefail
+          IMG=ems/dotnet-base:10.0-mcr
+          {
+            echo "image=${IMG}"
+            echo "base=mcr.microsoft.com/dotnet/aspnet:${{ inputs.aspnet_tag }}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "image_id=$(docker inspect --format '{{.Id}}' "$IMG")"
+            echo "layer_diff_ids=$(docker inspect --format '{{json .RootFS.Layers}}' "$IMG")"
+            echo "size_bytes=$(docker inspect --format '{{.Size}}' "$IMG")"
+          } | tee digest.txt
+
+      - name: 导出 + 分片
+        run: |
+          set -euo pipefail
+          docker save ems/dotnet-base:10.0-mcr | gzip -1 > base.tar.gz
+          sha256sum base.tar.gz | tee base.tar.gz.sha256
+          ls -lh base.tar.gz
+          split -b 45m -d -a 2 base.tar.gz base.part-
+          sha256sum base.part-* > base.parts.sha256
+          ls -lh base.part-*
+
+      - name: 发布 Release 资产
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dotnet-base-10.0-mcr
+          name: dotnet-base 10.0-mcr (${{ inputs.aspnet_tag }})
+          body: |
+            官方 `mcr.microsoft.com/dotnet/aspnet:${{ inputs.aspnet_tag }}` + 补齐层
+            （libfontconfig1 / libfreetype6 / libgssapi-krb5-2 / curl），
+            并把内置 `app` 用户改名为 `appuser`（uid/gid 仍 1654）。
+
+            内网导入后业务 Dockerfile 只改 `FROM` 一行即可。
+          files: |
+            base.tar.gz
+            base.tar.gz.sha256
+            digest.txt
+            base.part-*
+            base.parts.sha256
+          overwrite_files: true
+          fail_on_unmatched_files: false
