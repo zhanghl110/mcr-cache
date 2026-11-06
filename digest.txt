@@ -1,0 +1,8 @@
+image=mcr.microsoft.com/dotnet/aspnet:10.0
+alias=mcr.microsoft.com/dotnet/aspnet:10.0.14
+pulled_at=2026-11-06T05:30:10Z
+runner_arch=x86_64
+repo_digest=mcr.microsoft.com/dotnet/aspnet@sha256:1a48394b6f29d3a32c79d9edecd4abda0ecbe8776d567dbfc4590ed6979c740c
+image_id=sha256:81ffa690d64b8e93070a7648014b40ef75734e23cb030b7721e0a1617716a3ce
+created=2026-11-05T22:59:02.690526687Z
+size_bytes=230040023
