@@ -1,0 +1,11 @@
+# 基线镜像内容（除 Dockerfile 外都不需要进构建上下文）
+dist/
+*.tar.gz
+*.part-*
+*.sha256
+digest.txt
+.git/
+.gitignore
+README.md
+*.yml
+*.md

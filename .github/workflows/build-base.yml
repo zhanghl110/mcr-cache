@@ -1,0 +1,93 @@
+# =============================================================================
+# build-base.yml —— ems/dotnet-base:10.0-mcr 基线镜像的自动构建与发布
+#
+# 放置位置：<仓库>/.github/workflows/build-base.yml
+# 依赖文件（需一并 push 到仓库，与 workflow 同目录层或子目录）：
+#   Dockerfile / build-base.sh / publish-release.sh / verify-base.sh / load-base.sh
+#
+# 为什么在 runner 构建：内网 apt 被 NOSPLIT 劫持，apt-get install 装不了
+#   libfontconfig1 等包；runner 有干净的公网 apt。
+#
+# 产物：Release「dotnet-base-10.0-mcr」下的
+#   base.tar.gz / base.tar.gz.sha256 / digest.txt / base.part-* / base.parts.sha256
+#
+# 与 v1 的区别（血的教训）：不再内联 Dockerfile，直接使用仓库里的 Dockerfile，
+#   并在构建前校验「不得包含 USER」——v1 因结尾 USER appuser 导致下游构建全线失败。
+# =============================================================================
+name: build-dotnet-base
+
+on:
+  workflow_dispatch:
+    inputs:
+      subdir:
+        description: '脚本所在子目录（本目录推到仓库根就填 .）'
+        required: true
+        default: '.'
+      primary_tag:
+        description: '主 tag（如 10.0-mcr）'
+        required: true
+        default: '10.0-mcr'
+      release_tag:
+        description: 'Release tag（固定值，内网 URL 才可预测）'
+        required: true
+        default: 'dotnet-base-10.0-mcr'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-dotnet-base
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    env:
+      REPO_IMG: ems/dotnet-base
+      PRIMARY_TAG: ${{ inputs.primary_tag }}
+      REL_TAG: ${{ inputs.release_tag }}
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 构建 + 自检 + 导出
+        working-directory: ${{ inputs.subdir }}
+        run: |
+          set -euo pipefail
+          ls -l
+          bash build-base.sh
+
+      - name: 发布 Release
+        working-directory: ${{ inputs.subdir }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 账号/仓库名由 gh 从 git remote 推断，无需额外传参
+          bash publish-release.sh
+
+      - name: 平台侧备份（Actions Artifact，防止 Release 资产被误删）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-base-${{ inputs.primary_tag }}
+          path: |
+            ${{ inputs.subdir }}/dist/base.tar.gz
+            ${{ inputs.subdir }}/dist/base.tar.gz.sha256
+            ${{ inputs.subdir }}/dist/digest.txt
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: 输出摘要
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "### 基线镜像产物" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat "${{ inputs.subdir }}/dist/digest.txt" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "内网导入：\`REPO=${{ github.repository }} REL=${{ inputs.release_tag }} bash load-base.sh\`" >> "$GITHUB_STEP_SUMMARY"
