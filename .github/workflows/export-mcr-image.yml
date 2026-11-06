@@ -128,10 +128,15 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      # checkout 只为两件事：① gh 能推断出仓库，② git 有可用的 origin 与凭证。
+      # 仓库必然非空（workflow 文件本身就在里面），checkout 不会失败。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: 取回分片资产
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
           gh release download "aspnet-${{ inputs.tag }}" \
             --repo "${GITHUB_REPOSITORY}" \
@@ -140,22 +145,24 @@ jobs:
             --pattern 'digest.txt' -D out
           ls -lh out
 
-      - name: 写入孤儿分支 image-cache（不依赖仓库已有提交）
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: 写入孤儿分支 image-cache
         run: |
           set -euo pipefail
-          git init -q .
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # 建孤儿分支：索引里还带着 main 的文件，先清索引，再清工作区
           git checkout -q --orphan image-cache
+          git rm -rq --cached . || true
+          find . -mindepth 1 -maxdepth 1 ! -name out ! -name .git -exec rm -rf {} +
+
           cp out/* .
           rm -rf out
           printf 'image=mcr.microsoft.com/dotnet/aspnet:%s\nparts=%s\n' \
             "${{ inputs.tag }}" "$(ls image.part-* | wc -l)" > IMAGE_INFO
+
           git add -A
           git commit -q -m "cache: aspnet ${{ inputs.tag }}"
-          git push -f origin image-cache
+          git push -f origin HEAD:image-cache
           echo "已推送 image-cache 分支："
-          git ls-tree -l --name-only HEAD
+          git ls-tree -l HEAD
