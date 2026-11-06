@@ -1,32 +1,32 @@
 # =============================================================================
+# 【已废弃 2026-11-05】本文件由 ../EMS-DOTNET10-MCR/build-base.yml 取代。
+#   新方案把 Dockerfile 独立成文件（单一来源）、脚本拆成 构建/发布/导入/校验 四段，
+#   镜像名定为 ems/dotnet-base:10.0-mcr。本文件仅作历史留档，不要再运行。
+# =============================================================================
 # build-mcr-base.yml —— 在 GitHub Actions 上构建「官方 aspnet + 补齐层」基线镜像
 #
 # 放置位置：<仓库>/.github/workflows/build-mcr-base.yml
+# 配套文件：仓库根目录的 Dockerfile.mcr-base（唯一权威定义，本工作流直接取用）
 #
 # 为什么在这构建：内网 apt 源被劫持（NOSPLIT），装不了 libfontconfig1 等包；
 #                 runner 有干净的公网 apt，构建完整镜像导出，内网只 load。
 #
-# 产物：Release「dotnet-base-10.0-mcr」下的 base.tar.gz + 分片 + digest.txt
+# 版本：v2 —— 修正 v1 的缺陷：v1 的 Dockerfile 结尾误写 `USER appuser`，
+#       导致下游业务镜像所有 RUN 以 uid 1654 执行，构建在 `ln -snf /etc/localtime`
+#       处 Permission denied。v2 改为以 root 收尾，并在构建前做静态校验拦截。
+#
+# 产物：Release「dotnet-base-10.0-mcr-v2」下的 base.tar.gz + 分片 + digest.txt
 # =============================================================================
 name: build-mcr-base
 
 on:
   workflow_dispatch:
-    inputs:
-      aspnet_tag:
-        description: '官方 aspnet 标签'
-        required: true
-        default: '10.0'
-      split:
-        description: '切 45MB 分片'
-        type: boolean
-        default: true
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-mcr-base
+  group: build-mcr-base-v2
   cancel-in-progress: false
 
 jobs:
@@ -35,66 +35,60 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: 写基线 Dockerfile（内联，不依赖仓库文件）
+      - name: 检出仓库（基线 Dockerfile 的唯一来源）
+        uses: actions/checkout@v4
+
+      - name: 静态校验基线 Dockerfile
         run: |
-          cat > Dockerfile.mcr-base <<'DOCKERFILE'
-          FROM mcr.microsoft.com/dotnet/aspnet:${{ inputs.aspnet_tag }}
-
-          ARG APP_UID=1654
-          ARG APP_GID=1654
-
-          ENV TZ=Asia/Shanghai \
-              HOME=/app \
-              DOTNET_RUNNING_IN_CONTAINER=true
-
-          RUN set -eux; \
-              apt-get update; \
-              apt-get install -y --no-install-recommends \
-                  libfontconfig1 libfreetype6 libgssapi-krb5-2 curl; \
-              ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
-              echo "${TZ}" > /etc/timezone; \
-              rm -rf /var/lib/apt/lists/*; \
-              mkdir -p /app/DataProtection /app/logs; \
-              usermod -l appuser -d /app -s /usr/sbin/nologin app; \
-              chown -R "${APP_UID}:${APP_GID}" /app
-
-          RUN set -eux; \
-              command -v dotnet; \
-              dotnet --list-runtimes | grep -q 'Microsoft.AspNetCore.App 10\.'; \
-              ldconfig -p | grep -q libfontconfig; \
-              ldconfig -p | grep -q libfreetype; \
-              ldconfig -p | grep -q libgssapi_krb5; \
-              command -v curl; \
-              test -e /usr/share/zoneinfo/Asia/Shanghai; \
-              getent passwd 1654 | grep -q appuser
-
-          USER appuser
-          DOCKERFILE
-          sed -i 's/^[[:space:]]*//' Dockerfile.mcr-base
-          cat Dockerfile.mcr-base
+          set -euo pipefail
+          test -f Dockerfile.mcr-base || {
+            echo "::error file=Dockerfile.mcr-base::仓库根目录缺少 Dockerfile.mcr-base，请先 push 该文件（本工作流不再内联生成）"
+            exit 1
+          }
+          grep -qE '^FROM mcr\.microsoft\.com/dotnet/aspnet:' Dockerfile.mcr-base || {
+            echo "::error::FROM 必须指向官方 aspnet 镜像"
+            exit 1
+          }
+          if grep -qE '^USER[[:space:]]' Dockerfile.mcr-base; then
+            echo "::error file=Dockerfile.mcr-base::基线不得包含 USER 指令；否则下游业务镜像的每个 RUN 会以 uid 1654 执行并因权限失败"
+            exit 1
+          fi
+          grep -q 'usr/sbin/nologin app' Dockerfile.mcr-base || {
+            echo "::error::缺少 usermod 把 app 改名 appuser 的步骤"
+            exit 1
+          }
+          echo "== 基线文件校验通过 =="
+          grep -nE '^FROM|^USER|nologin|apt-get install' Dockerfile.mcr-base
 
       - name: 构建
         run: |
           set -euo pipefail
-          docker build -f Dockerfile.mcr-base -t "ems/dotnet-base:10.0-mcr" .
+          docker build -f Dockerfile.mcr-base -t "ems/dotnet-base:10.0-mcr-v2" .
 
       - name: 运行期自检
         run: |
           set -euo pipefail
-          IMG=ems/dotnet-base:10.0-mcr
+          IMG=ems/dotnet-base:10.0-mcr-v2
+          # 基线必须以 root 收尾：$(id -u) 必须是 0
+          test "$(docker run --rm "$IMG" id -u)" = "0" || {
+            echo "::error::基线运行身份不是 root，说明 Dockerfile 结尾被加了 USER"; exit 1; }
           docker run --rm "$IMG" cat /etc/os-release | head -3
           docker run --rm "$IMG" dotnet --info | sed -n '1,12p'
           docker run --rm "$IMG" sh -c 'id; echo "HOME=$HOME"; echo "ASPNETCORE_HTTP_PORTS=$ASPNETCORE_HTTP_PORTS"'
           docker run --rm "$IMG" sh -c 'ldconfig -p | grep -cE "libfontconfig|libfreetype|libgssapi_krb5"'
           docker run --rm "$IMG" sh -c 'curl --version | head -1'
+          # appuser 已改名且属主/家目录正确
+          docker run --rm "$IMG" sh -c 'getent passwd 1654'
+          docker run --rm "$IMG" sh -c 'test -d /app/DataProtection && test -d /app/logs && echo "/app 子目录就绪"'
 
       - name: 记录校验基准
         run: |
           set -euo pipefail
-          IMG=ems/dotnet-base:10.0-mcr
+          IMG=ems/dotnet-base:10.0-mcr-v2
           {
             echo "image=${IMG}"
-            echo "base=mcr.microsoft.com/dotnet/aspnet:${{ inputs.aspnet_tag }}"
+            echo "base=$(awk '/^FROM /{print $2; exit}' Dockerfile.mcr-base)"
+            echo "dockerfile_sha256=$(sha256sum Dockerfile.mcr-base | cut -d' ' -f1)"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "image_id=$(docker inspect --format '{{.Id}}' "$IMG")"
             echo "layer_diff_ids=$(docker inspect --format '{{json .RootFS.Layers}}' "$IMG")"
@@ -104,7 +98,7 @@ jobs:
       - name: 导出 + 分片
         run: |
           set -euo pipefail
-          docker save ems/dotnet-base:10.0-mcr | gzip -1 > base.tar.gz
+          docker save ems/dotnet-base:10.0-mcr-v2 | gzip -1 > base.tar.gz
           sha256sum base.tar.gz | tee base.tar.gz.sha256
           ls -lh base.tar.gz
           split -b 45m -d -a 2 base.tar.gz base.part-
@@ -114,14 +108,19 @@ jobs:
       - name: 发布 Release 资产
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: dotnet-base-10.0-mcr
-          name: dotnet-base 10.0-mcr (${{ inputs.aspnet_tag }})
+          tag_name: dotnet-base-10.0-mcr-v2
+          name: dotnet-base 10.0-mcr v2
           body: |
-            官方 `mcr.microsoft.com/dotnet/aspnet:${{ inputs.aspnet_tag }}` + 补齐层
+            v2：修正 v1 的致命缺陷 —— 基线结尾误写 `USER appuser`，
+            导致下游业务镜像所有 `RUN` 以 uid 1654 执行，构建在
+            `ln -snf /etc/localtime` 处 `Permission denied`。v2 以 root 收尾。
+
+            内容：官方 `mcr.microsoft.com/dotnet/aspnet:10.0` + 补齐层
             （libfontconfig1 / libfreetype6 / libgssapi-krb5-2 / curl），
             并把内置 `app` 用户改名为 `appuser`（uid/gid 仍 1654）。
 
-            内网导入后业务 Dockerfile 只改 `FROM` 一行即可。
+            内网导入后业务 Dockerfile **只改 `FROM` 一行**即可，
+            不再需要 `USER root` 之类的补丁。
           files: |
             base.tar.gz
             base.tar.gz.sha256
